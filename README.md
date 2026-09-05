@@ -15,7 +15,7 @@ Compared with Mintbot's [`5914122` revision](https://github.com/nepiy/mintbot/tr
 | Sale execution | Mint transaction signing and broadcasting. | Also validate supported canonical Seaport 1.6 fulfillment calls, submit required NFT approval, and execute eligible offers. |
 | Setup and simulation | Mint configuration and mint simulation. | Add auto-sell setup prompts, collection and offer-token settings, and offer/fulfillment preflight with `auto_sell.dry_run_token_id`. |
 
-This version also adds integer-based fee/profit arithmetic and fixes around transaction outcome tracking, receipt confirmations after re-mining, local wallet nonce coordination, configuration saving, and trigger validation. See [the repository review](REVIEW.md) for details and verification limits. The two repositories have diverged; this copy does not necessarily include every later Mintbot performance change.
+This version also adds integer-based fee/profit arithmetic and fixes around transaction outcome tracking, receipt confirmations after re-mining, local wallet nonce coordination, configuration saving, and trigger validation. It includes Mintbot's `5914122` normal/aggressive execution improvements: concurrent OpenSea, fee, balance, and nonce preparation; responsive aggressive-mode refreshes; RPC endpoint deduplication; and latency reporting. See [the repository review](REVIEW.md) and [the performance notes](PERFORMANCE.md) for details and verification limits.
 
 Auto-sell is **disabled by default**. Enable `auto_sell.enabled` through the setup wizard or a JSON configuration, supply an OpenSea API key and collection slug, and configure trusted offer-token addresses and any required USD prices. The default minimum profit is `$0`; raise `auto_sell.min_profit_usd` to require a margin. It accepts existing offers rather than creating sale listings. Missing offers, unsupported fulfillment payloads, or insufficient estimated profit prevent a sale; profitability is an estimate, not a guarantee.
 
@@ -62,11 +62,14 @@ These protections prevent the bot from quietly turning a mint configuration into
 - Monitors every new block through WebSocket instead of polling a timer.
 - Prepares configuration, ABI, calldata, gas strategy, balance checks, and subscriptions before `BOT ARMED`.
 - Refreshes dynamic fee fields while waiting.
-- Overlaps the final OpenSea transaction build and fee estimate at the trigger.
+- Overlaps the final OpenSea transaction build, normal-mode fee/balance reads, and just-in-time nonce selection at the trigger.
+- Keeps block and event monitoring responsive during aggressive-mode cache refreshes; only one refresh runs at a time, and its completion overlaps the OpenSea request.
 - Supports normal and aggressive OpenSea execution modes for public, GTD, and FCFS stages.
 - Refreshes the OpenSea stage schedule while waiting in automatic OpenSea mode.
 - Reuses one OpenSea HTTP client and retries transient transaction-build responses with bounded backoff.
 - Broadcasts identical signed bytes concurrently through the validated WebSocket and HTTP endpoints.
+- Deduplicates identical HTTP RPC URLs across primary, backup, and broadcast settings.
+- Prints trigger-to-send and trigger-to-acknowledgement latency immediately after submission.
 - Reconnects WebSocket subscriptions and backfills missed event logs after a transport interruption.
 - Supports bounded transaction replacement with the same nonce when explicitly enabled.
 
@@ -365,7 +368,15 @@ The RPC benchmark tests the generic `HTTP_RPC_URL` and `WS_RPC_URL` pair:
 ./target/release/nft-mint-bot rpc-test
 ```
 
-If you use only a network-specific profile, the interactive startup in Step 10 validates that profile instead. It checks chain IDs, deployed contract bytecode, wallet balance, WebSocket subscriptions, and every usable broadcast endpoint before printing `BOT ARMED`.
+To benchmark the same network-specific profile used by a mint, pass its chain ID:
+
+```bash
+./target/release/nft-mint-bot rpc-test --chain-id 4663
+./target/release/nft-mint-bot rpc-test --chain-id 57073
+./target/release/nft-mint-bot rpc-test --chain-id 999
+```
+
+The interactive startup in Step 10 validates that profile too. It checks chain IDs, deployed contract bytecode, wallet balance, WebSocket subscriptions, and every usable broadcast endpoint before printing `BOT ARMED`.
 
 ### Step 10 — Configure one mint path and make it `BOT ARMED`
 
@@ -556,8 +567,10 @@ The automatic schedule refreshes every 30 seconds normally and every 5 seconds w
 
 ### Step 13 — Choose normal or aggressive OpenSea execution
 
-- `normal` is recommended. It obtains fresh fees, performs live gas simulation, checks balance, and selects the nonce just before signing.
-- `aggressive` minimizes trigger-path RPC work. It continuously prewarms fee, nonce, and balance data, uses the configured gas limit, and skips live gas simulation plus the final balance RPC.
+- `normal` is recommended. It starts the OpenSea build, fresh fee lookup, balance lookup, and just-in-time nonce lookup concurrently. Live gas simulation follows using the validated calldata and updated fees, then the exact payment and gas are checked against the fresh balance.
+- `aggressive` minimizes trigger-path RPC work. It prewarms fee, nonce, and balance data without blocking block/event monitoring, uses the configured gas limit, and skips live gas simulation plus the final balance RPC (except Ink's required live surcharge/balance check). If a refresh is in flight at the trigger, it overlaps the OpenSea build; refreshed fields must be valid before signing.
+
+Both modes hold the wallet nonce lock through broadcast acknowledgement. The latency report is printed immediately after submission. See [PERFORMANCE.md](PERFORMANCE.md) for the controlled comparison and the limits of those measurements.
 
 Aggressive mode still enforces eligibility, calldata, payment, gas-cost, and balance guards, but it carries more risk: changed on-chain state or an insufficient fixed gas limit can produce a reverted transaction that still consumes gas. It requires explicit `gas.gas_limit` and `gas.max_total_gas_cost_native` values.
 
@@ -774,7 +787,7 @@ Nonce modes are:
 
 - `preloaded`: prepares a nonce at startup.
 - `refresh_each_block`: refreshes the prepared nonce on each waiting block.
-- `just_before_trigger`: obtains the pending nonce after the trigger wins and immediately before signing.
+- `just_before_trigger`: obtains a fresh pending nonce under the wallet lock during trigger preparation, concurrently with preflight/OpenSea work. The lock remains held through broadcast acknowledgement and receipt monitoring.
 
 All modes fetch the pending nonce again under the local wallet lock immediately before signing. The lock stays held through mint receipt monitoring and replacements, then releases before auto-sell acquires it. This coordinates local bot instances; avoid sending unrelated transactions from the same wallet.
 
