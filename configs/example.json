@@ -1,0 +1,51 @@
+{
+  "name": "Example NFT (edit before use)",
+  "chain_id": 31337,
+  "native_currency": "ETH",
+  "mint_payment_currency": "ETH",
+  "mint_payment_decimals": 18,
+  "contract_address": "0x0000000000000000000000000000000000000000",
+  "opensea_execution_mode": "normal",
+  "expected_contract_code_hash": null,
+  "quantity": 1,
+  "mint": {
+    "function": "mint(uint256)",
+    "arguments": ["$quantity"],
+    "price_per_nft": "0"
+  },
+  "trigger": {
+    "type": "boolean_contract_state",
+    "function": "publicSaleActive() returns (bool)",
+    "expected_value": true
+  },
+  "gas": {
+    "mode": "auto",
+    "multiplier": 1.15,
+    "gas_limit": 200000,
+    "max_total_gas_cost_native": "0.01"
+  },
+  "nonce_strategy": "preloaded",
+  "replacement": {
+    "enabled": false,
+    "after_blocks": 2,
+    "fee_multiplier": 1.15,
+    "max_attempts": 2
+  },
+  "auto_sell": {
+    "enabled": false,
+    "collection_slug": "example-collection",
+    "opensea_chain": null,
+    "min_profit_usd": "25",
+    "offer_wait_seconds": 180,
+    "offer_poll_seconds": 5,
+    "receipt_timeout_seconds": 180,
+    "include_optional_creator_fees": false,
+    "max_sell_gas_cost_native": "0.001",
+    "require_usd_price": true,
+    "currency_usd_prices": {},
+    "currency_token_addresses": {},
+    "dry_run_token_id": null
+  },
+  "expected_start_time": null,
+  "confirmations": 1
+}

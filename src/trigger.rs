@@ -1,0 +1,301 @@
+use crate::{
+    abi::{encode_view_call, parse_event},
+    config::{MintConfig, MintTrigger},
+    error::{BotError, Result},
+    rpc::RpcClients,
+};
+use alloy::{
+    consensus::BlockHeader,
+    dyn_abi::{DynSolType, FunctionExt, Specifier},
+    eips::BlockId,
+    network::TransactionBuilder,
+    primitives::{Address, B256, U256},
+    rpc::types::{Filter, Header, TransactionRequest},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerObservation {
+    NotReady,
+    Ready,
+}
+
+pub struct TriggerEngine {
+    contract: Address,
+    trigger: MintTrigger,
+    view_call: Option<(alloy::json_abi::Function, Vec<u8>)>,
+    numeric_target: Option<U256>,
+    event_filter: Option<Filter>,
+    pending_event: Option<PendingEvent>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingEvent {
+    block_number: u64,
+    block_hash: Option<B256>,
+}
+
+impl TriggerEngine {
+    pub fn new(config: &MintConfig) -> Result<Self> {
+        let view_call = match &config.trigger {
+            MintTrigger::BooleanContractState { function, .. }
+            | MintTrigger::NumericPhase { function, .. } => Some(encode_view_call(function)?),
+            _ => None,
+        };
+        let numeric_target = match &config.trigger {
+            MintTrigger::NumericPhase { target_value, .. } => {
+                Some(target_value.parse::<U256>().map_err(|err| {
+                    BotError::Trigger(format!("invalid numeric phase `{target_value}`: {err}"))
+                })?)
+            }
+            _ => None,
+        };
+        if let Some((function, _)) = &view_call {
+            let output = function
+                .outputs
+                .first()
+                .and_then(|output| output.resolve().ok());
+            let valid = match (&config.trigger, output) {
+                (MintTrigger::BooleanContractState { .. }, Some(DynSolType::Bool)) => true,
+                (MintTrigger::NumericPhase { .. }, Some(DynSolType::Uint(bits))) => {
+                    numeric_target.is_some_and(|target| target.bit_len() <= bits)
+                }
+                _ => false,
+            };
+            if function.outputs.len() != 1 || !valid {
+                return Err(BotError::Trigger("view trigger requires one matching bool/uint return type and a representable target".into()));
+            }
+        }
+        let event_filter = match &config.trigger {
+            MintTrigger::ContractEvent { signature, .. } => {
+                let event = parse_event(signature)?;
+                Some(
+                    Filter::new()
+                        .address(config.contract()?)
+                        .event(&event.signature()),
+                )
+            }
+            _ => None,
+        };
+        Ok(Self {
+            contract: config.contract()?,
+            trigger: config.trigger.clone(),
+            view_call,
+            numeric_target,
+            event_filter,
+            pending_event: None,
+        })
+    }
+
+    pub fn event_filter(&self) -> Option<Filter> {
+        self.event_filter.clone()
+    }
+
+    pub fn trigger(&self) -> &MintTrigger {
+        &self.trigger
+    }
+
+    pub fn set_block_timestamp(&mut self, timestamp: u64) -> Result<()> {
+        let MintTrigger::BlockTimestamp { timestamp: current } = &mut self.trigger else {
+            return Err(BotError::Trigger(
+                "OpenSea stage scheduling requires a block timestamp trigger".to_string(),
+            ));
+        };
+        *current = timestamp;
+        Ok(())
+    }
+
+    pub fn observe_event(
+        &mut self,
+        block_number: Option<u64>,
+        block_hash: Option<B256>,
+        removed: bool,
+    ) -> TriggerObservation {
+        let MintTrigger::ContractEvent { confirmations, .. } = &self.trigger else {
+            return TriggerObservation::NotReady;
+        };
+        if removed {
+            if self
+                .pending_event
+                .is_some_and(|pending| pending.block_hash == block_hash)
+            {
+                self.pending_event = None;
+            }
+            return TriggerObservation::NotReady;
+        }
+        let (Some(block_number), Some(block_hash)) = (block_number, block_hash) else {
+            return TriggerObservation::NotReady;
+        };
+        // Repeated events must not restart the confirmation window forever.
+        if self
+            .pending_event
+            .is_none_or(|event| block_number < event.block_number)
+        {
+            self.pending_event = Some(PendingEvent {
+                block_number,
+                block_hash: Some(block_hash),
+            });
+        }
+        let confirmations = confirmations.unwrap_or(0);
+        if confirmations <= 1 {
+            return TriggerObservation::Ready;
+        }
+        TriggerObservation::NotReady
+    }
+
+    pub fn pending_event(&self) -> Option<(u64, Option<B256>)> {
+        self.pending_event
+            .map(|event| (event.block_number, event.block_hash))
+    }
+
+    pub fn clear_pending_event(&mut self) {
+        self.pending_event = None;
+    }
+
+    pub async fn observe_block(
+        &mut self,
+        header: &Header,
+        rpc: &RpcClients,
+    ) -> Result<TriggerObservation> {
+        match &self.trigger {
+            MintTrigger::BlockTimestamp { timestamp } => Ok(if header.timestamp() >= *timestamp {
+                TriggerObservation::Ready
+            } else {
+                TriggerObservation::NotReady
+            }),
+            MintTrigger::BooleanContractState { expected_value, .. } => {
+                let actual = self.read_bool(rpc, BlockId::hash(header.hash)).await?;
+                Ok(if actual == *expected_value {
+                    TriggerObservation::Ready
+                } else {
+                    TriggerObservation::NotReady
+                })
+            }
+            MintTrigger::NumericPhase { .. } => {
+                let target = self.numeric_target.ok_or_else(|| {
+                    BotError::Trigger("numeric phase target was not prepared".to_string())
+                })?;
+                let actual = self.read_uint(rpc, BlockId::hash(header.hash)).await?;
+                Ok(if actual == target {
+                    TriggerObservation::Ready
+                } else {
+                    TriggerObservation::NotReady
+                })
+            }
+            MintTrigger::ContractEvent { confirmations, .. } => {
+                let Some(event) = self.pending_event else {
+                    return Ok(TriggerObservation::NotReady);
+                };
+                let needed = event
+                    .block_number
+                    .saturating_add(confirmations.unwrap_or(0).saturating_sub(1));
+                Ok(if header.number() >= needed {
+                    TriggerObservation::Ready
+                } else {
+                    TriggerObservation::NotReady
+                })
+            }
+            MintTrigger::Manual => Ok(TriggerObservation::NotReady),
+        }
+    }
+
+    async fn read_bool(&self, rpc: &RpcClients, block: BlockId) -> Result<bool> {
+        let (function, calldata) = self
+            .view_call
+            .as_ref()
+            .ok_or_else(|| BotError::Trigger("boolean view call was not prepared".to_string()))?;
+        let output = rpc
+            .call_at(
+                TransactionRequest::default()
+                    .with_to(self.contract)
+                    .with_input(calldata.clone()),
+                block,
+            )
+            .await
+            .map_err(|err| BotError::Rpc(err.to_string()))?;
+        let values = function
+            .abi_decode_output(&output)
+            .map_err(|err| BotError::Trigger(format!("could not decode boolean state: {err}")))?;
+        match values.first() {
+            Some(alloy::dyn_abi::DynSolValue::Bool(value)) => Ok(*value),
+            _ => Err(BotError::Trigger(format!(
+                "{} did not return a bool",
+                function.signature()
+            ))),
+        }
+    }
+
+    async fn read_uint(&self, rpc: &RpcClients, block: BlockId) -> Result<U256> {
+        let (function, calldata) = self
+            .view_call
+            .as_ref()
+            .ok_or_else(|| BotError::Trigger("numeric view call was not prepared".to_string()))?;
+        let output = rpc
+            .call_at(
+                TransactionRequest::default()
+                    .with_to(self.contract)
+                    .with_input(calldata.clone()),
+                block,
+            )
+            .await
+            .map_err(|err| BotError::Rpc(err.to_string()))?;
+        let values = function
+            .abi_decode_output(&output)
+            .map_err(|err| BotError::Trigger(format!("could not decode numeric phase: {err}")))?;
+        match values.first() {
+            Some(alloy::dyn_abi::DynSolValue::Uint(value, _)) => Ok(*value),
+            _ => Err(BotError::Trigger(format!(
+                "{} did not return an unsigned integer",
+                function.signature()
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn event_inclusion_counts_as_the_first_confirmation() {
+        let (rpc, server) =
+            crate::rpc::tests::mock_rpc(|_| panic!("event count needs no RPC")).await;
+        for confirmations in [0_u64, 1, 2, 5] {
+            let config: MintConfig = serde_json::from_value(serde_json::json!({
+                "name":"event test", "chain_id":1,
+                "contract_address":"0x0000000000000000000000000000000000000001",
+                "quantity":1, "mint":{"function":"mint(uint256)"},
+                "trigger":{"type":"contract_event", "signature":"SaleStarted()", "confirmations":confirmations}
+            })).unwrap();
+            let mut engine = TriggerEngine::new(&config).unwrap();
+            assert_eq!(
+                engine.observe_event(None, None, false),
+                TriggerObservation::NotReady
+            );
+            assert_eq!(
+                engine.observe_event(Some(100), None, false),
+                TriggerObservation::NotReady
+            );
+            assert_eq!(
+                engine.observe_event(Some(100), Some(B256::ZERO), false),
+                if confirmations <= 1 {
+                    TriggerObservation::Ready
+                } else {
+                    TriggerObservation::NotReady
+                }
+            );
+            let needed = 100 + confirmations.saturating_sub(1);
+            let mut header: Header = Header::default();
+            header.inner.number = needed - 1;
+            assert_eq!(
+                engine.observe_block(&header, &rpc).await.unwrap(),
+                TriggerObservation::NotReady
+            );
+            header.inner.number = needed;
+            assert_eq!(
+                engine.observe_block(&header, &rpc).await.unwrap(),
+                TriggerObservation::Ready
+            );
+        }
+        server.abort();
+    }
+}

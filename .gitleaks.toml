@@ -1,0 +1,8 @@
+title = "mintbot secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated build and Git object data only; never exclude secret files"
+paths = ['''^target/''', '''^\.git/''']
