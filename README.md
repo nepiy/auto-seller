@@ -4,7 +4,7 @@ This is a clone of [Mintbot (`nepiy/mintbot`)](https://github.com/nepiy/mintbot)
 
 ## What's different from Mintbot?
 
-Compared with Mintbot's [`5914122` revision](https://github.com/nepiy/mintbot/tree/59141226f22113138d0e2901a750e6c1f054ff23):
+Compared with Mintbot's [`687f5a4` revision](https://github.com/nepiy/mintbot/tree/687f5a43649df5da814a57d9ea248157ebc1d168):
 
 | Area | Mintbot | Auto Seller |
 | --- | --- | --- |
@@ -15,7 +15,7 @@ Compared with Mintbot's [`5914122` revision](https://github.com/nepiy/mintbot/tr
 | Sale execution | Mint transaction signing and broadcasting. | Also validate supported canonical Seaport 1.6 fulfillment calls, submit required NFT approval, and execute eligible offers. |
 | Setup and simulation | Mint configuration and mint simulation. | Add auto-sell setup prompts, collection and offer-token settings, and offer/fulfillment preflight with `auto_sell.dry_run_token_id`. |
 
-This version also adds integer-based fee/profit arithmetic and fixes around transaction outcome tracking, receipt confirmations after re-mining, local wallet nonce coordination, configuration saving, and trigger validation. It includes Mintbot's `5914122` normal/aggressive execution improvements: concurrent OpenSea, fee, balance, and nonce preparation; responsive aggressive-mode refreshes; RPC endpoint deduplication; and latency reporting. See [the repository review](REVIEW.md) and [the performance notes](PERFORMANCE.md) for details and verification limits.
+This version also adds integer-based fee/profit arithmetic and fixes around transaction outcome tracking, receipt confirmations after re-mining, local wallet nonce coordination, configuration saving, and trigger validation. It includes Mintbot's normal/aggressive execution improvements: concurrent OpenSea, fee, balance, and nonce preparation; responsive aggressive-mode refreshes; RPC endpoint deduplication; and latency reporting. See [the repository review](REVIEW.md) and [the performance notes](PERFORMANCE.md) for details and verification limits.
 
 Auto-sell is **disabled by default**. Enable `auto_sell.enabled` through the setup wizard or a JSON configuration, supply an OpenSea API key and collection slug, and configure trusted offer-token addresses and any required USD prices. The default minimum profit is `$0`; raise `auto_sell.min_profit_usd` to require a margin. It accepts existing offers rather than creating sale listings. Missing offers, unsupported fulfillment payloads, or insufficient estimated profit prevent a sale; profitability is an estimate, not a guarantee.
 
@@ -30,6 +30,7 @@ The interactive launcher supports:
 - Robinhood Chain mainnet — chain ID `4663`
 - Ink mainnet — chain ID `57073`
 - HyperEVM mainnet — chain ID `999` (native gas token: HYPE)
+- Abstract mainnet — chain ID `2741` (native gas token: ETH)
 
 Advanced JSON configurations can target other EVM-compatible networks by providing the correct chain ID, RPC endpoints, contract address, mint ABI, and trigger.
 
@@ -266,12 +267,15 @@ The interactive launcher supports these profiles:
 | Robinhood Chain mainnet | `4663` | `ROBINHOOD_HTTP_RPC_URL`, `ROBINHOOD_WS_RPC_URL` |
 | Ink mainnet | `57073` | `INK_HTTP_RPC_URL`, `INK_WS_RPC_URL` |
 | HyperEVM mainnet | `999` | `HYPEREVM_HTTP_RPC_URL`, `HYPEREVM_WS_RPC_URL` |
+| Abstract mainnet | `2741` | `ABSTRACT_HTTP_RPC_URL`, `ABSTRACT_WS_RPC_URL` |
 
 If either network-specific HTTP or WebSocket variable is filled, that profile is selected and both values must be valid. If a selected network has no profile values, the bot falls back to `HTTP_RPC_URL` and `WS_RPC_URL`.
 
 The included `.env.example` contains Ink’s public HTTPS and WebSocket endpoints. Replace them with dedicated endpoints when reliability matters. See [Ink RPC documentation](https://docs.inkonchain.com/tools/rpc).
 
 For HyperEVM, the official HTTPS endpoint is `https://rpc.hyperliquid.xyz/evm` and HYPE is the native gas token. Hyperliquid’s official endpoint does not provide WebSocket JSON-RPC, so configure `HYPEREVM_WS_RPC_URL` with a WSS-capable HyperEVM provider for block monitoring. Keep `HYPEREVM_HTTP_RPC_URL` and any backup/broadcast URLs on HyperEVM. See [Hyperliquid HyperEVM documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm).
+
+For Abstract, use `https://api.mainnet.abs.xyz` and `wss://api.mainnet.abs.xyz/ws`, or replace them with dedicated endpoints. Abstract gas estimation includes ZK execution and pubdata overhead, so normal mode estimates the eligible transaction; aggressive mode requires a tested fixed gas limit. See [Abstract network details](https://docs.abs.xyz/connect-to-abstract).
 
 ### Step 7 — Obtain an OpenSea API key if needed
 
@@ -345,6 +349,11 @@ HYPEREVM_HTTP_RPC_URL=https://rpc.hyperliquid.xyz/evm
 HYPEREVM_WS_RPC_URL=wss://your-hyperevm-websocket-rpc.example
 HYPEREVM_BACKUP_RPC_URL=
 HYPEREVM_BROADCAST_RPC_URLS=
+
+ABSTRACT_HTTP_RPC_URL=https://api.mainnet.abs.xyz
+ABSTRACT_WS_RPC_URL=wss://api.mainnet.abs.xyz/ws
+ABSTRACT_BACKUP_RPC_URL=
+ABSTRACT_BROADCAST_RPC_URLS=
 ```
 
 Environment-variable rules:
@@ -433,7 +442,7 @@ Windows PowerShell:
 
 Answer the prompts in this order:
 
-1. Network: `1` for Robinhood Chain mainnet, `2` for Ink mainnet, or `3` for HyperEVM mainnet.
+1. Network: `1` for Robinhood Chain mainnet, `2` for Ink mainnet, `3` for HyperEVM mainnet, or `4` for Abstract mainnet.
 2. Collection contract address.
 3. OpenSea drop slug.
 4. Quantity.
