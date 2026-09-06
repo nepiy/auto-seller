@@ -51,6 +51,10 @@ pub async fn run_bot(config_path: PathBuf, dry_run: bool) -> Result<()> {
 }
 
 pub async fn run_interactive(dry_run: bool) -> Result<()> {
+    if crate::setup::prompt_auto_buy_selection()? {
+        return crate::autobuy::run_auto_buy(crate::setup::prompt_auto_buy_config()?, dry_run)
+            .await;
+    }
     let config = prompt_interactive_config()?;
     run_bot_with_config(config, None, dry_run).await
 }

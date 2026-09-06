@@ -14,6 +14,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Watch OpenSea listings and purchase until the configured quantity is reached.
+    AutoBuy {
+        /// Omit to configure the purchase interactively.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
     Setup {
         #[arg(long, default_value = "configs")]
         output: PathBuf,

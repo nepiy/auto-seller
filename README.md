@@ -1,10 +1,60 @@
 # Auto Seller
 
-This is a clone of [Mintbot (`nepiy/mintbot`)](https://github.com/nepiy/mintbot), extended with an optional post-mint NFT auto-sell workflow on OpenSea. It keeps the original Rust-based, event-driven EVM minting engine and adds offer evaluation, profit checks, and sale execution after a successful mint.
+This is a clone of [Mintbot (`nepiy/mintbot`)](https://github.com/nepiy/mintbot), extended with OpenSea auto-buy and optional post-mint NFT auto-sell. It keeps the original Rust-based, event-driven EVM minting engine and adds listing purchases, offer evaluation, profit checks, and sale execution.
+
+## Interactive auto-buy
+
+Run `cargo run --release` or `cargo run --release -- start` to choose:
+
+```text
+1. Auto-buy
+2. Mint and auto-sell
+```
+
+Option 2 opens the existing mint setup, including its optional auto-sell prompts. Existing `setup`, `run --config`, and `simulate --config` commands still use mint configurations.
+
+Option 1 asks for the network, NFT contract address from OpenSea, target USD price per NFT, **price tolerance (%)**, total purchase quantity, normal/aggressive gas mode, maximum gas cost, and a purchase session name. The collection slug is resolved automatically from the contract on the selected chain.
+
+- **Price range:** `$50` with `10%` tolerance buys only from `$45` through `$55`, inclusive. A cheaper `$44` listing is outside this requested range. Marketplace and required creator fees are included in the purchase price; gas is separate. USD comparisons use integer arithmetic, and the payable value is rechecked against a fresh USD quote before signing.
+- **Quantity:** purchases execute one at a time. A confirmed NFT transfer increments progress; the bot continues watching until the total is reached. Reverted transactions do not increment progress, and their order hashes are skipped for the rest of the session, including after restart. ERC-721 tokens already purchased in this session are skipped even when OpenSea returns duplicate or stale listings. ERC-1155 orders can supply additional single units.
+- **Networks:** Robinhood (`4663`), Ink (`57073`), HyperEVM (`999`), and Abstract (`2741`) use their existing RPC profiles. Fund native ETH on Robinhood, Ink, and Abstract, or HYPE on HyperEVM.
+- **Gas:** normal bids 1.2× the current EIP-1559 fee estimate; aggressive bids 2×. Both simulate and estimate the actual Seaport call with a 20% gas-limit margin and enforce `max_gas_cost_native`. Abstract uses its own RPC estimate, including pubdata. Ink also reserves L1 data and operator fees. Aggressive bidding cannot guarantee inclusion.
+- **Failed-gas budget:** `max_failed_gas_cost_native` defaults to `0.003` ETH/HYPE per session. Actual gas spent on reverted transactions is saved, including Ink L1/operator fees. A new attempt must fit its estimated maximum gas cost within the remaining loss budget; otherwise the bot stops with a clear error. Changing the session name resets this accounting, so reuse the same session when resuming.
+- **Eligible listings:** fixed-price, single-asset ERC-721/1155 listings paid in native ETH/HYPE through canonical Seaport 1.6. ERC-20 payments (including WETH), swaps, bundles, auctions, criteria orders, and variable-price orders are skipped. The bot watches OpenSea's fulfillable order book, which can differ from the aggregated floor displayed on OpenSea.
+
+Configure `PRIVATE_KEY`, `OPENSEA_API_KEY`, and the selected chain's HTTP/WSS RPC variables in your protected `.env`. Set `COINMARKETCAP_API_KEY` for live ETH/USD and HYPE/USD quotes. `ETH_USD_PRICE` / `HYPE_USD_PRICE` are optional **fixed overrides**, not live feeds; leave them blank for live valuation. `PRICE_ORACLE_URL` configures the ETH feed; `HYPE_PRICE_ORACLE_URL` configures HYPE separately. A missing/invalid price prevents purchasing; temporary network/API failures are retried.
+
+Preview the current eligible purchase without signing or sending:
+
+```bash
+cargo run --release -- start --dry-run
+# Or go directly to auto-buy setup:
+cargo run --release -- auto-buy --dry-run
+```
+
+For repeatable runs, copy [the auto-buy example](configs/auto-buy.example.json), replace its placeholder NFT contract, and set your limits:
+
+```bash
+cp configs/auto-buy.example.json configs/my-buy.json
+cargo run --release -- auto-buy --config configs/my-buy.json --dry-run
+cargo run --release -- auto-buy --config configs/my-buy.json
+```
+
+Each discovery cycle refreshes the floor page, then checks at most one later page. Live mode preserves the later-page cursor between cycles and starts cycles every five seconds by default, subject to API/RPC response time and transaction preparation. It does not sleep between pages or wait for a complete collection scan before checking the floor again. Missed timer ticks are skipped rather than generating a burst of requests. USD quotes are refreshed for each page and again before signing.
+
+Dry-run performs one such cycle (at most two pages) and simulates an eligible purchase if available. It does not scan the entire collection, wait for a future price, sign transactions, or advance purchase progress.
+
+Progress is saved atomically under `auto-buy-state/` and excluded from Git. Reuse the same wallet, chain, contract, session name, and working directory to resume. Price, quantity, and gas changes preserve that session's progress. Use a **new session name** to buy a new batch after completion. The bot holds a local wallet nonce lock while watching, so another bot using the same wallet and chain waits.
+
+Before broadcast, the journal saves the exact signed transaction, nonce, hash, and selected NFT. On restart the bot checks for a receipt first; if none exists, it validates the stored transaction's hash, nonce, chain, target, and signer, then rebroadcasts those identical bytes. This recovers a crash before or during submission without using a new nonce or creating an extra purchase. Existing pending transactions retain their originally signed payment and fee limits even when you change the configuration.
+
+If every endpoint definitively rejects the first submission, its pending state is cleared and that order is skipped without charging the failed-gas budget. A rejection after an earlier or uncertain attempt does **not** clear pending state, because a previous send may still confirm. Receipt timeouts retain the journal and transaction hash for another restart. Legacy journals without signed bytes can still reconcile receipts, but cannot safely reconstruct an unsent transaction. They require inspection if no receipt ever appears. Check the transaction on the selected chain before removing pending state; deleting it while it can still confirm may cause an extra purchase. Saved signed bytes are not private keys, but anyone with those bytes can submit that already-authorized transaction.
+
+API references: [collection best listings](https://docs.opensea.io/reference/get_best_listings_collection), [listing fulfillment](https://docs.opensea.io/reference/generate_listing_fulfillment_data_v2), and [contract metadata](https://docs.opensea.io/reference/get_contract). Automated tests use mock OpenSea and RPC servers; they do not demonstrate live mainnet purchases.
 
 ## What's different from Mintbot?
 
-Compared with Mintbot's [`5914122` revision](https://github.com/nepiy/mintbot/tree/59141226f22113138d0e2901a750e6c1f054ff23):
+Compared with Mintbot's [`687f5a4` revision](https://github.com/nepiy/mintbot/tree/687f5a43649df5da814a57d9ea248157ebc1d168):
 
 | Area | Mintbot | Auto Seller |
 | --- | --- | --- |
@@ -15,7 +65,7 @@ Compared with Mintbot's [`5914122` revision](https://github.com/nepiy/mintbot/tr
 | Sale execution | Mint transaction signing and broadcasting. | Also validate supported canonical Seaport 1.6 fulfillment calls, submit required NFT approval, and execute eligible offers. |
 | Setup and simulation | Mint configuration and mint simulation. | Add auto-sell setup prompts, collection and offer-token settings, and offer/fulfillment preflight with `auto_sell.dry_run_token_id`. |
 
-This version also adds integer-based fee/profit arithmetic and fixes around transaction outcome tracking, receipt confirmations after re-mining, local wallet nonce coordination, configuration saving, and trigger validation. It includes Mintbot's `5914122` normal/aggressive execution improvements: concurrent OpenSea, fee, balance, and nonce preparation; responsive aggressive-mode refreshes; RPC endpoint deduplication; and latency reporting. See [the repository review](REVIEW.md) and [the performance notes](PERFORMANCE.md) for details and verification limits.
+This version also adds integer-based fee/profit arithmetic and fixes around transaction outcome tracking, receipt confirmations after re-mining, local wallet nonce coordination, configuration saving, and trigger validation. It includes Mintbot's normal/aggressive execution improvements: concurrent OpenSea, fee, balance, and nonce preparation; responsive aggressive-mode refreshes; RPC endpoint deduplication; and latency reporting. See [the repository review](REVIEW.md) and [the performance notes](PERFORMANCE.md) for details and verification limits.
 
 Auto-sell is **disabled by default**. Enable `auto_sell.enabled` through the setup wizard or a JSON configuration, supply an OpenSea API key and collection slug, and configure trusted offer-token addresses and any required USD prices. The default minimum profit is `$0`; raise `auto_sell.min_profit_usd` to require a margin. It accepts existing offers rather than creating sale listings. Missing offers, unsupported fulfillment payloads, or insufficient estimated profit prevent a sale; profitability is an estimate, not a guarantee.
 
@@ -30,6 +80,7 @@ The interactive launcher supports:
 - Robinhood Chain mainnet — chain ID `4663`
 - Ink mainnet — chain ID `57073`
 - HyperEVM mainnet — chain ID `999` (native gas token: HYPE)
+- Abstract mainnet — chain ID `2741` (native gas token: ETH)
 
 Advanced JSON configurations can target other EVM-compatible networks by providing the correct chain ID, RPC endpoints, contract address, mint ABI, and trigger.
 
@@ -266,12 +317,15 @@ The interactive launcher supports these profiles:
 | Robinhood Chain mainnet | `4663` | `ROBINHOOD_HTTP_RPC_URL`, `ROBINHOOD_WS_RPC_URL` |
 | Ink mainnet | `57073` | `INK_HTTP_RPC_URL`, `INK_WS_RPC_URL` |
 | HyperEVM mainnet | `999` | `HYPEREVM_HTTP_RPC_URL`, `HYPEREVM_WS_RPC_URL` |
+| Abstract mainnet | `2741` | `ABSTRACT_HTTP_RPC_URL`, `ABSTRACT_WS_RPC_URL` |
 
 If either network-specific HTTP or WebSocket variable is filled, that profile is selected and both values must be valid. If a selected network has no profile values, the bot falls back to `HTTP_RPC_URL` and `WS_RPC_URL`.
 
 The included `.env.example` contains Ink’s public HTTPS and WebSocket endpoints. Replace them with dedicated endpoints when reliability matters. See [Ink RPC documentation](https://docs.inkonchain.com/tools/rpc).
 
 For HyperEVM, the official HTTPS endpoint is `https://rpc.hyperliquid.xyz/evm` and HYPE is the native gas token. Hyperliquid’s official endpoint does not provide WebSocket JSON-RPC, so configure `HYPEREVM_WS_RPC_URL` with a WSS-capable HyperEVM provider for block monitoring. Keep `HYPEREVM_HTTP_RPC_URL` and any backup/broadcast URLs on HyperEVM. See [Hyperliquid HyperEVM documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm).
+
+For Abstract, use `https://api.mainnet.abs.xyz` and `wss://api.mainnet.abs.xyz/ws`, or replace them with dedicated endpoints. Abstract gas estimation includes ZK execution and pubdata overhead, so normal mode estimates the eligible transaction; aggressive mode requires a tested fixed gas limit. See [Abstract network details](https://docs.abs.xyz/connect-to-abstract).
 
 ### Step 7 — Obtain an OpenSea API key if needed
 
@@ -345,6 +399,11 @@ HYPEREVM_HTTP_RPC_URL=https://rpc.hyperliquid.xyz/evm
 HYPEREVM_WS_RPC_URL=wss://your-hyperevm-websocket-rpc.example
 HYPEREVM_BACKUP_RPC_URL=
 HYPEREVM_BROADCAST_RPC_URLS=
+
+ABSTRACT_HTTP_RPC_URL=https://api.mainnet.abs.xyz
+ABSTRACT_WS_RPC_URL=wss://api.mainnet.abs.xyz/ws
+ABSTRACT_BACKUP_RPC_URL=
+ABSTRACT_BROADCAST_RPC_URLS=
 ```
 
 Environment-variable rules:
@@ -433,7 +492,7 @@ Windows PowerShell:
 
 Answer the prompts in this order:
 
-1. Network: `1` for Robinhood Chain mainnet, `2` for Ink mainnet, or `3` for HyperEVM mainnet.
+1. Network: `1` for Robinhood Chain mainnet, `2` for Ink mainnet, `3` for HyperEVM mainnet, or `4` for Abstract mainnet.
 2. Collection contract address.
 3. OpenSea drop slug.
 4. Quantity.

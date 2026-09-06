@@ -31,6 +31,13 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
+        Some(Command::AutoBuy { config, dry_run }) => {
+            let config = match config {
+                Some(path) => nft_mint_bot::autobuy::AutoBuyConfig::load(&path)?,
+                None => nft_mint_bot::setup::prompt_auto_buy_config()?,
+            };
+            nft_mint_bot::autobuy::run_auto_buy(config, dry_run).await?;
+        }
         Some(Command::Setup { output }) => {
             run_wizard(&output)?;
         }
