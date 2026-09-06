@@ -51,6 +51,9 @@ pub enum BotError {
     )]
     BroadcastOutcomeUnknown { hash: B256 },
 
+    #[error("all configured broadcast endpoints rejected the raw transaction")]
+    BroadcastRejected,
+
     #[error("OpenSea API error ({status}): {message}")]
     OpenSeaApi { status: u16, message: String },
 

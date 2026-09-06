@@ -13,9 +13,10 @@ use crate::{
     wallet::{LoadedWallet, WalletNonceLock},
 };
 use alloy::{
-    eips::Encodable2718,
+    consensus::{Transaction, TxEnvelope},
+    eips::{Decodable2718, Encodable2718},
     network::TransactionBuilder,
-    primitives::{Address, B256, U256, address, keccak256},
+    primitives::{Address, B256, Bytes, U256, address, keccak256},
     rpc::types::{TransactionReceipt, TransactionRequest},
 };
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,9 @@ pub struct AutoBuyConfig {
     pub gas_mode: OpenSeaExecutionMode,
     #[serde(default = "default_gas_cap")]
     pub max_gas_cost_native: String,
+    /// Maximum cumulative gas lost to reverted transactions in this session.
+    #[serde(default = "default_failed_gas_cap")]
+    pub max_failed_gas_cost_native: String,
     #[serde(default = "default_poll")]
     pub poll_seconds: u64,
     #[serde(default = "default_receipt_timeout")]
@@ -54,6 +58,9 @@ pub struct AutoBuyConfig {
 }
 fn default_gas_cap() -> String {
     "0.001".into()
+}
+fn default_failed_gas_cap() -> String {
+    "0.003".into()
 }
 fn default_poll() -> u64 {
     5
@@ -86,7 +93,9 @@ impl AutoBuyConfig {
         {
             return Err(BotError::Config("auto-buy requires a nonzero contract, positive quantity/timers/confirmations, and a session name of 1–128 bytes".into()));
         }
-        if parse_native_amount(&self.max_gas_cost_native)?.is_zero() {
+        if parse_native_amount(&self.max_gas_cost_native)?.is_zero()
+            || parse_native_amount(&self.max_failed_gas_cost_native)?.is_zero()
+        {
             return Err(BotError::Config(
                 "auto-buy gas budget must be positive".into(),
             ));
@@ -386,6 +395,22 @@ struct PendingBuy {
     order_hash: B256,
     token_id: U256,
     item_type: u8,
+    #[serde(default)]
+    raw_transaction: Option<Bytes>,
+    #[serde(default)]
+    nonce: Option<u64>,
+    // Legacy journals may already have broadcast: never assume otherwise.
+    #[serde(default = "already_attempted")]
+    broadcast_attempted: bool,
+}
+fn already_attempted() -> bool {
+    true
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryCursor {
+    next: Option<String>,
+    seen: BTreeSet<String>,
 }
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct BuyProgress {
@@ -393,6 +418,12 @@ struct BuyProgress {
     completed_orders: BTreeSet<B256>,
     purchased_erc721: BTreeSet<U256>,
     pending: Option<PendingBuy>,
+    #[serde(default)]
+    failed_orders: BTreeSet<B256>,
+    #[serde(default)]
+    failed_gas_cost_native: U256,
+    #[serde(skip)]
+    discovery: DiscoveryCursor,
 }
 impl BuyProgress {
     fn load(path: &Path) -> Result<Self> {
@@ -426,6 +457,8 @@ impl BuyProgress {
                 self.completed_orders.insert(pending.order_hash);
                 self.purchased_erc721.insert(pending.token_id);
             }
+        } else {
+            self.failed_orders.insert(pending.order_hash);
         }
         Ok(())
     }
@@ -457,6 +490,11 @@ pub async fn run_auto_buy(config: AutoBuyConfig, dry_run: bool) -> Result<()> {
     let wallet = LoadedWallet::from_env()?;
     let client = OpenSeaClient::from_env()?;
     let oracle = PriceOracle::new()?;
+    println!(
+        "Session gas-loss limit: {} {}. Reverted orders are skipped for this session.",
+        config.max_failed_gas_cost_native,
+        config.native_symbol()
+    );
     let mut rpc = RpcClients::connect_from_env_for_chain(config.chain_id).await?;
     rpc.validate_chain_id(config.chain_id).await?;
     rpc.validate_contract_address(config.contract_address, None)
@@ -518,13 +556,20 @@ impl BuyRunner<'_> {
                     "a purchase is pending; run live mode to reconcile its receipt",
                 ));
             }
-            reconcile_pending(config, rpc, wallet.address, &mut progress, path).await?;
+            self.recover_pending(&mut progress).await?;
         }
+        let mut poll = tokio::time::interval(Duration::from_secs(config.poll_seconds));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         while progress.purchased < config.quantity {
+            ensure_failure_budget(config, &progress, U256::ZERO)?;
+            tokio::select! {
+                _ = poll.tick() => {},
+                _ = tokio::signal::ctrl_c() => return Ok(()),
+            }
             // Ctrl-C may cancel discovery/preparation, never a submission: after
             // signing, persist the tx identity and retain it until receipt resolution.
             let prepared = tokio::select! {
-                result = find_purchase(config, client, rpc, oracle, slug, wallet.address, &progress) => result,
+                result = find_purchase(config, client, rpc, oracle, slug, wallet.address, &mut progress) => result,
                 _ = tokio::signal::ctrl_c() => { println!("Auto-buy stopped; progress saved."); return Ok(()); }
             };
             match prepared {
@@ -536,6 +581,7 @@ impl BuyRunner<'_> {
                         );
                         return Ok(());
                     }
+                    let nonce = request.nonce;
                     let signed = wallet.sign_request(request).await?;
                     let raw = signed.encoded_2718();
                     let pending = PendingBuy {
@@ -543,16 +589,14 @@ impl BuyRunner<'_> {
                         order_hash: listing.hash,
                         token_id: listing.token_id,
                         item_type: listing.item_type,
+                        raw_transaction: Some(raw.into()),
+                        nonce,
+                        broadcast_attempted: false,
                     };
                     println!("Submitting token {}: {}", pending.token_id, pending.hash);
                     progress.pending = Some(pending);
                     progress.save(path)?;
-                    // Even a rejected/ambiguous response may race another endpoint.
-                    // Preserve the pending identity and reconcile before any new buy.
-                    if let Err(error) = rpc.broadcast_raw(raw).await {
-                        tracing::warn!(%error, "broadcast did not confirm acceptance; checking the saved transaction");
-                    }
-                    reconcile_pending(config, rpc, wallet.address, &mut progress, path).await?;
+                    self.recover_pending(&mut progress).await?;
                     println!(
                         "Purchased {}/{} NFT(s).",
                         progress.purchased, config.quantity
@@ -579,10 +623,6 @@ impl BuyRunner<'_> {
                 }
                 Err(error) => return Err(error),
             }
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(config.poll_seconds)) => {},
-                _ = tokio::signal::ctrl_c() => { println!("Auto-buy stopped; progress saved."); return Ok(()); }
-            }
         }
         println!(
             "Auto-buy complete: {}/{} purchased. Use a new session name for another batch.",
@@ -590,6 +630,95 @@ impl BuyRunner<'_> {
         );
         Ok(())
     }
+
+    async fn recover_pending(&self, progress: &mut BuyProgress) -> Result<()> {
+        let pending = progress
+            .pending
+            .clone()
+            .ok_or_else(|| invalid("missing pending purchase"))?;
+        // A mined receipt (even if not yet fully confirmed) must be reconciled,
+        // never replaced by another purchase or another nonce.
+        if self.rpc.transaction_receipt(pending.hash).await?.is_none()
+            && let Some(raw) = &pending.raw_transaction
+        {
+            validate_saved_transaction(&pending, self.config.chain_id, self.wallet.address)?;
+            // Record ambiguity BEFORE calling RPC, covering a crash during send.
+            progress
+                .pending
+                .as_mut()
+                .expect("pending exists")
+                .broadcast_attempted = true;
+            progress.save(self.path)?;
+            match self.rpc.broadcast_raw(raw.to_vec()).await {
+                Ok(_) => {}
+                Err(BotError::BroadcastRejected) if !pending.broadcast_attempted => {
+                    // Only the first attempt can be proven not to have an older
+                    // acceptance. On recovery, retain state despite rejection.
+                    progress.finish(false)?;
+                    progress.save(self.path)?;
+                    tracing::warn!(hash = %pending.hash, "all endpoints rejected the first submission; skipping this order");
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "retaining pending transaction and checking its receipt")
+                }
+            }
+        }
+        reconcile_pending(
+            self.config,
+            self.rpc,
+            self.wallet.address,
+            progress,
+            self.path,
+        )
+        .await
+    }
+}
+
+fn validate_saved_transaction(pending: &PendingBuy, chain_id: u64, buyer: Address) -> Result<()> {
+    let raw = pending
+        .raw_transaction
+        .as_ref()
+        .ok_or_else(|| invalid("missing saved transaction bytes"))?;
+    let mut input = raw.as_ref();
+    let tx =
+        TxEnvelope::decode_2718(&mut input).map_err(|_| invalid("invalid saved transaction"))?;
+    if !input.is_empty()
+        || keccak256(raw) != pending.hash
+        || tx.chain_id() != Some(chain_id)
+        || Some(tx.nonce()) != pending.nonce
+        || tx.to() != Some(SEAPORT)
+        || tx
+            .signature()
+            .recover_address_from_prehash(&tx.signature_hash())
+            .ok()
+            != Some(buyer)
+    {
+        return Err(invalid(
+            "saved transaction does not match its hash, nonce, chain, target, or wallet",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_failure_budget(
+    config: &AutoBuyConfig,
+    progress: &BuyProgress,
+    reserve: U256,
+) -> Result<()> {
+    let cap = parse_native_amount(&config.max_failed_gas_cost_native)?;
+    if progress.failed_gas_cost_native >= cap
+        || progress
+            .failed_gas_cost_native
+            .checked_add(reserve)
+            .ok_or_else(overflow)?
+            > cap
+    {
+        return Err(invalid(
+            "session gas-loss budget exhausted or insufficient for another attempt; review max_failed_gas_cost_native",
+        ));
+    }
+    Ok(())
 }
 
 fn retryable(error: &BotError) -> bool {
@@ -612,15 +741,43 @@ async fn find_purchase(
     oracle: &PriceOracle,
     slug: &str,
     buyer: Address,
-    progress: &BuyProgress,
+    progress: &mut BuyProgress,
 ) -> Result<Option<(Listing, TransactionRequest)>> {
-    let mut next = None;
-    let mut cursors = BTreeSet::new();
-    let snapshot = oracle
-        .snapshot(&[config.native_symbol()], &Default::default())
-        .await?;
-    loop {
+    // Every cycle refreshes the floor, then at most one later page. Preserve
+    // that later-page cursor so large collections still get complete coverage.
+    for page_index in 0..2 {
+        let next = if page_index == 0 {
+            None
+        } else {
+            progress.discovery.next.clone()
+        };
+        if page_index == 1 && next.is_none() {
+            break;
+        }
         let page = client.listing_page(slug, next.as_deref()).await?;
+        let following = page
+            .get("next")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        if page_index == 0 && progress.discovery.next.is_none() {
+            progress.discovery.seen.clear();
+            progress.discovery.next = following;
+        } else if page_index == 1 {
+            if !progress
+                .discovery
+                .seen
+                .insert(next.expect("later page has cursor"))
+            {
+                progress.discovery = DiscoveryCursor::default();
+                tracing::warn!("OpenSea repeated a cursor; restarting discovery from the floor");
+                break;
+            }
+            progress.discovery.next = following;
+        }
+        let snapshot = oracle
+            .snapshot(&[config.native_symbol()], &Default::default())
+            .await?;
         let listings = list(field(&page, "listings")?)?;
         for value in listings {
             let listing = match parse_listing(value, config, buyer) {
@@ -631,6 +788,7 @@ async fn find_purchase(
                 }
             };
             if progress.completed_orders.contains(&listing.hash)
+                || progress.failed_orders.contains(&listing.hash)
                 || (listing.item_type == 2 && progress.purchased_erc721.contains(&listing.token_id))
             {
                 continue;
@@ -703,6 +861,7 @@ async fn find_purchase(
                 tracing::warn!(%gas_cost, %cap, "purchase gas exceeds budget; waiting");
                 continue;
             }
+            ensure_failure_budget(config, progress, gas_cost)?;
             let needed = fulfillment
                 .transaction
                 .value
@@ -740,20 +899,8 @@ async fn find_purchase(
             );
             return Ok(Some((listing, request)));
         }
-        next = page
-            .get("next")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        match &next {
-            Some(cursor) if cursors.insert(cursor.clone()) => {
-                // Respect API rate limits during pagination of large collections.
-                tokio::time::sleep(Duration::from_secs(config.poll_seconds)).await;
-            }
-            Some(_) => return Err(invalid("OpenSea repeated a pagination cursor")),
-            None => return Ok(None),
-        }
     }
+    Ok(None)
 }
 
 async fn reconcile_pending(
@@ -793,7 +940,21 @@ async fn reconcile_pending(
         ));
     }
     if !receipt.status() {
-        println!("Purchase reverted; it does not count toward the target. Watching again.");
+        let mut cost = U256::from(receipt.gas_used)
+            .checked_mul(U256::from(receipt.effective_gas_price))
+            .ok_or_else(overflow)?;
+        if config.chain_id == INK_MAINNET_CHAIN_ID {
+            cost = cost
+                .checked_add(rpc.ink_receipt_extra_fee(&receipt).await?)
+                .ok_or_else(overflow)?;
+        }
+        progress.failed_gas_cost_native = progress
+            .failed_gas_cost_native
+            .checked_add(cost)
+            .ok_or_else(overflow)?;
+        println!(
+            "Purchase reverted; skipping this order for the rest of the session. Watching other listings."
+        );
     }
     progress.finish(receipt.status())?;
     progress.save(path)

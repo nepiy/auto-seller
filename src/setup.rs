@@ -157,6 +157,7 @@ pub fn prompt_auto_buy_config() -> Result<crate::autobuy::AutoBuyConfig> {
         quantity,
         gas_mode,
         max_gas_cost_native,
+        max_failed_gas_cost_native: "0.003".into(),
         poll_seconds: 5,
         receipt_timeout_seconds: 180,
         confirmations: 2,

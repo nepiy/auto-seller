@@ -742,9 +742,7 @@ impl RpcClients {
                 hash: expected_hash,
             });
         }
-        Err(BotError::Transaction(
-            "all configured broadcast endpoints rejected the raw transaction".to_string(),
-        ))
+        Err(BotError::BroadcastRejected)
     }
 }
 
@@ -958,7 +956,11 @@ pub(crate) mod tests {
                             reader.read_exact(&mut body).await.unwrap();
                             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                             let result = response(request.clone()).await;
-                            let body = serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result}).to_string();
+                            let body = if let Some(error) = result.get("__mock_rpc_error") {
+                                serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "error":error})
+                            } else {
+                                serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                            }.to_string();
                             let _ = reader.get_mut().write_all(format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
                             ).as_bytes()).await;
