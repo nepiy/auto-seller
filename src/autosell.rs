@@ -1575,9 +1575,11 @@ fn decode_batch_ids(data: &[u8]) -> Vec<U256> {
     if ids.len() != amounts.len() {
         return Vec::new();
     }
-    ids.chunks_exact(32)
-        .zip(amounts.chunks_exact(32))
-        .filter(|(_, amount)| !U256::from_be_slice(amount).is_zero())
+    ids.as_chunks::<32>()
+        .0
+        .iter()
+        .zip(amounts.as_chunks::<32>().0.iter())
+        .filter(|(_, amount)| !U256::from_be_slice(amount.as_slice()).is_zero())
         .map(|(id, _)| U256::from_be_slice(id))
         .collect()
 }

@@ -291,8 +291,7 @@ pub fn validate_fulfillment(
     let input = &tx.input_data;
     let name = crate::abi::parse_function(&tx.function)?.name;
     let parameters;
-    let total;
-    if name == "fulfillBasicOrder" || name == "fulfillBasicOrder_efficient_6GL6yc" {
+    let total = if name == "fulfillBasicOrder" || name == "fulfillBasicOrder_efficient_6GL6yc" {
         parameters = input
             .get("parameters")
             .or_else(|| input.get("basicOrderParameters"))
@@ -317,7 +316,7 @@ pub fn validate_fulfillment(
                 .checked_add(uint(field(recipient, "amount")?)?)
                 .ok_or_else(overflow)?;
         }
-        total = amount;
+        amount
     } else if name == "fulfillOrder" || name == "fulfillAdvancedOrder" {
         let advanced = name == "fulfillAdvancedOrder";
         let order = if advanced {
@@ -369,10 +368,10 @@ pub fn validate_fulfillment(
                 "fulfillment must transfer exactly one selected NFT",
             ));
         }
-        total = native_consideration(parameters, numerator, denominator)?;
+        native_consideration(parameters, numerator, denominator)?
     } else {
         return Err(invalid("unsupported listing fulfillment function"));
-    }
+    };
     if addr(field(parameters, "offerer")?)? == buyer
         || uint(field(parameters, "startTime")?)? > U256::from(now)
         || uint(field(parameters, "endTime")?)? <= U256::from(now)
