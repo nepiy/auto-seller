@@ -283,6 +283,10 @@ impl RpcClients {
     }
 
     pub async fn validate_chain(&mut self, config: &MintConfig) -> Result<()> {
+        self.validate_chain_id(config.chain_id).await
+    }
+
+    pub async fn validate_chain_id(&mut self, expected_chain_id: u64) -> Result<()> {
         let ws_chain_id = tokio::time::timeout(self.request_timeout, self.ws.get_chain_id())
             .await
             .map_err(|_| BotError::Rpc("WebSocket chain ID check timed out".to_string()))?
@@ -292,22 +296,22 @@ impl RpcClients {
                     summarize_rpc_error(&err.to_string())
                 ))
             })?;
-        if ws_chain_id != config.chain_id {
+        if ws_chain_id != expected_chain_id {
             return Err(BotError::ChainMismatch {
-                configured: config.chain_id,
+                configured: expected_chain_id,
                 reported: ws_chain_id,
             });
         }
         let mut healthy = Vec::new();
         for (name, provider) in self.broadcast.iter() {
             match tokio::time::timeout(self.request_timeout, provider.get_chain_id()).await {
-                Ok(Ok(chain_id)) if chain_id == config.chain_id => {
+                Ok(Ok(chain_id)) if chain_id == expected_chain_id => {
                     healthy.push((name.clone(), provider.clone()));
                 }
                 Ok(Ok(chain_id)) => {
                     return Err(BotError::Config(format!(
                         "RPC provider `{name}` reports chain ID {chain_id}, expected {}",
-                        config.chain_id
+                        expected_chain_id
                     )));
                 }
                 Ok(Err(err)) => {
@@ -348,6 +352,15 @@ impl RpcClients {
 
     pub async fn validate_contract(&self, config: &MintConfig) -> Result<B256> {
         let contract = config.contract()?;
+        self.validate_contract_address(contract, config.expected_contract_code_hash_value()?)
+            .await
+    }
+
+    pub async fn validate_contract_address(
+        &self,
+        contract: Address,
+        pinned_hash: Option<B256>,
+    ) -> Result<B256> {
         let codes = self
             .read_all("eth_getCode", move |provider| async move {
                 provider.get_code_at(contract).await
@@ -372,7 +385,7 @@ impl RpcClients {
                 "RPC providers returned different bytecode for the configured contract".to_string(),
             ));
         }
-        if let Some(pinned_hash) = config.expected_contract_code_hash_value()?
+        if let Some(pinned_hash) = pinned_hash
             && expected_hash != pinned_hash
         {
             return Err(BotError::Config(format!(

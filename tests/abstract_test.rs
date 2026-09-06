@@ -13,7 +13,7 @@ fn abstract_normal_launcher_selects_chain_and_validates_config() {
     isolated_bot(directory.path())
         .args(["start", "--dry-run"])
         .write_stdin(
-            "4\n0x0000000000000000000000000000000000000001\nabstract-drop\n1\nyes\nnormal\nno\n",
+            "2\n4\n0x0000000000000000000000000000000000000001\nabstract-drop\n1\nyes\nnormal\nno\n",
         )
         .assert()
         .failure()
@@ -28,7 +28,7 @@ fn abstract_aggressive_launcher_requires_a_tested_gas_limit() {
     isolated_bot(directory.path())
         .args(["start", "--dry-run"])
         .write_stdin(
-            "4\n0x0000000000000000000000000000000000000001\nabstract-drop\n1\nyes\naggressive\n0\n",
+            "2\n4\n0x0000000000000000000000000000000000000001\nabstract-drop\n1\nyes\naggressive\n0\n",
         )
         .assert()
         .failure()
@@ -37,7 +37,7 @@ fn abstract_aggressive_launcher_requires_a_tested_gas_limit() {
     isolated_bot(directory.path())
         .args(["start", "--dry-run"])
         .write_stdin(
-            "4\n0x0000000000000000000000000000000000000001\nabstract-drop\n1\nyes\naggressive\n1500000\nno\n",
+            "2\n4\n0x0000000000000000000000000000000000000001\nabstract-drop\n1\nyes\naggressive\n1500000\nno\n",
         )
         .assert()
         .failure()

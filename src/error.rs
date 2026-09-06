@@ -57,6 +57,9 @@ pub enum BotError {
     #[error("OpenSea API transport request failed")]
     OpenSeaTransport,
 
+    #[error("USD price temporarily unavailable: {0}")]
+    PriceUnavailable(String),
+
     #[error("manual trigger control error: {0}")]
     ManualTrigger(String),
 

@@ -1,6 +1,49 @@
 # Auto Seller
 
-This is a clone of [Mintbot (`nepiy/mintbot`)](https://github.com/nepiy/mintbot), extended with an optional post-mint NFT auto-sell workflow on OpenSea. It keeps the original Rust-based, event-driven EVM minting engine and adds offer evaluation, profit checks, and sale execution after a successful mint.
+This is a clone of [Mintbot (`nepiy/mintbot`)](https://github.com/nepiy/mintbot), extended with OpenSea auto-buy and optional post-mint NFT auto-sell. It keeps the original Rust-based, event-driven EVM minting engine and adds listing purchases, offer evaluation, profit checks, and sale execution.
+
+## Interactive auto-buy
+
+Run `cargo run --release` or `cargo run --release -- start` to choose:
+
+```text
+1. Auto-buy
+2. Mint and auto-sell
+```
+
+Option 2 opens the existing mint setup, including its optional auto-sell prompts. Existing `setup`, `run --config`, and `simulate --config` commands still use mint configurations.
+
+Option 1 asks for the network, NFT contract address from OpenSea, target USD price per NFT, **price tolerance (%)**, total purchase quantity, normal/aggressive gas mode, maximum gas cost, and a purchase session name. The collection slug is resolved automatically from the contract on the selected chain.
+
+- **Price range:** `$50` with `10%` tolerance buys only from `$45` through `$55`, inclusive. A cheaper `$44` listing is outside this requested range. Marketplace and required creator fees are included in the purchase price; gas is separate. USD comparisons use integer arithmetic, and the payable value is rechecked against a fresh USD quote before signing.
+- **Quantity:** purchases execute one at a time. A confirmed NFT transfer increments progress; the bot continues watching until the total is reached. Reverted transactions do not increment progress. ERC-721 tokens already purchased in this session are skipped even when OpenSea returns duplicate or stale listings. ERC-1155 orders can supply additional single units.
+- **Networks:** Robinhood (`4663`), Ink (`57073`), HyperEVM (`999`), and Abstract (`2741`) use their existing RPC profiles. Fund native ETH on Robinhood, Ink, and Abstract, or HYPE on HyperEVM.
+- **Gas:** normal bids 1.2× the current EIP-1559 fee estimate; aggressive bids 2×. Both simulate and estimate the actual Seaport call with a 20% gas-limit margin and enforce `max_gas_cost_native`. Abstract uses its own RPC estimate, including pubdata. Ink also reserves L1 data and operator fees. Aggressive bidding cannot guarantee inclusion.
+- **Eligible listings:** fixed-price, single-asset ERC-721/1155 listings paid in native ETH/HYPE through canonical Seaport 1.6. ERC-20 payments (including WETH), swaps, bundles, auctions, criteria orders, and variable-price orders are skipped. The bot watches OpenSea's fulfillable order book, which can differ from the aggregated floor displayed on OpenSea.
+
+Configure `PRIVATE_KEY`, `OPENSEA_API_KEY`, and the selected chain's HTTP/WSS RPC variables in your protected `.env`. Set `COINMARKETCAP_API_KEY` for live ETH/USD and HYPE/USD quotes. `ETH_USD_PRICE` / `HYPE_USD_PRICE` are optional **fixed overrides**, not live feeds; leave them blank for live valuation. `PRICE_ORACLE_URL` configures the ETH feed; `HYPE_PRICE_ORACLE_URL` configures HYPE separately. A missing/invalid price prevents purchasing; temporary network/API failures are retried.
+
+Preview the current eligible purchase without signing or sending:
+
+```bash
+cargo run --release -- start --dry-run
+# Or go directly to auto-buy setup:
+cargo run --release -- auto-buy --dry-run
+```
+
+For repeatable runs, copy [the auto-buy example](configs/auto-buy.example.json), replace its placeholder NFT contract, and set your limits:
+
+```bash
+cp configs/auto-buy.example.json configs/my-buy.json
+cargo run --release -- auto-buy --config configs/my-buy.json --dry-run
+cargo run --release -- auto-buy --config configs/my-buy.json
+```
+
+Dry-run checks current listings once (with pagination) and simulates an eligible purchase if available. It does not wait for a future price, sign transactions, or advance progress. Live mode polls every five seconds by default and continues until completion or Ctrl-C.
+
+Progress is saved atomically under `auto-buy-state/` and excluded from Git. Reuse the same wallet, chain, contract, session name, and working directory to resume. Price, quantity, and gas changes preserve that session's progress. Use a **new session name** to buy a new batch after completion. A submitted transaction is saved before broadcast; after a timeout or restart, its receipt must be resolved before another purchase. An ambiguous or never-mined transaction stops with its hash and retains pending state for inspection. Check that hash on the selected chain before removing any pending state; deleting it while a transaction can still confirm may cause an extra purchase. The bot holds a local wallet nonce lock while watching, so another bot using the same wallet and chain waits.
+
+API references: [collection best listings](https://docs.opensea.io/reference/get_best_listings_collection), [listing fulfillment](https://docs.opensea.io/reference/generate_listing_fulfillment_data_v2), and [contract metadata](https://docs.opensea.io/reference/get_contract). Automated tests use mock OpenSea and RPC servers; they do not demonstrate live mainnet purchases.
 
 ## What's different from Mintbot?
 

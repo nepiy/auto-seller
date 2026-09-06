@@ -84,6 +84,88 @@ pub fn prompt_interactive_config() -> Result<MintConfig> {
     prompt_config(false)
 }
 
+pub fn prompt_auto_buy_selection() -> Result<bool> {
+    println!("Select action:\n1. Auto-buy\n2. Mint and auto-sell");
+    match ask("Action", "2")?.as_str() {
+        "1" => Ok(true),
+        "2" => Ok(false),
+        _ => Err(BotError::Config(
+            "action must be 1 (auto-buy) or 2 (mint and auto-sell)".into(),
+        )),
+    }
+}
+
+pub fn prompt_auto_buy_config() -> Result<crate::autobuy::AutoBuyConfig> {
+    println!(
+        "NFT Auto-buy Setup\nSelect network:\n1. Robinhood Chain mainnet\n2. Ink mainnet\n3. HyperEVM mainnet\n4. Abstract mainnet"
+    );
+    let chain_id = match ask("Network", "1")?.as_str() {
+        "1" => ROBINHOOD_MAINNET_CHAIN_ID,
+        "2" => INK_MAINNET_CHAIN_ID,
+        "3" => HYPEREVM_MAINNET_CHAIN_ID,
+        "4" => ABSTRACT_MAINNET_CHAIN_ID,
+        _ => return Err(BotError::Config("network must be 1, 2, 3, or 4".into())),
+    };
+    let contract = ask("NFT contract address from OpenSea", "")?;
+    let contract_address = contract
+        .parse()
+        .map_err(|_| BotError::InvalidAddress { value: contract })?;
+    let target_price_usd = ask("Target purchase price per NFT (USD)", "50")?;
+    println!(
+        "Price tolerance is a symmetric range: $50 with 10% buys from $45 to $55. Marketplace fees are included; gas is separate."
+    );
+    let price_tolerance_percent = ask("Price tolerance (%)", "10")?;
+    let quantity = ask(
+        "Total NFTs to purchase (keeps watching until complete)",
+        "1",
+    )?
+    .parse()
+    .map_err(|_| BotError::Config("purchase quantity must be a positive integer".into()))?;
+    let gas_mode = match ask("Gas mode (normal/aggressive)", "normal")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "normal" => OpenSeaExecutionMode::Normal,
+        "aggressive" => OpenSeaExecutionMode::Aggressive,
+        _ => {
+            return Err(BotError::Config(
+                "gas mode must be normal or aggressive".into(),
+            ));
+        }
+    };
+    let symbol = if chain_id == HYPEREVM_MAINNET_CHAIN_ID {
+        "HYPE"
+    } else {
+        "ETH"
+    };
+    println!(
+        "Purchases use native {symbol}. Only fixed-price native-currency listings are eligible."
+    );
+    let max_gas_cost_native = ask(
+        &format!("Maximum gas cost per purchase ({symbol})"),
+        "0.001",
+    )?;
+    let session = ask(
+        "Purchase session name (reuse to resume; change for a new batch)",
+        "default",
+    )?;
+    let config = crate::autobuy::AutoBuyConfig {
+        chain_id,
+        contract_address,
+        target_price_usd,
+        price_tolerance_percent,
+        quantity,
+        gas_mode,
+        max_gas_cost_native,
+        poll_seconds: 5,
+        receipt_timeout_seconds: 180,
+        confirmations: 2,
+        session,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
 fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     println!("NFT Mint Setup\n");
     let name = if allow_manual {
